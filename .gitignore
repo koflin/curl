@@ -25,6 +25,7 @@
 .libs
 .project
 .settings
+.idea
 /.vs
 /bld/
 /build/

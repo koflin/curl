@@ -127,7 +127,29 @@ static CURLcode do_sendmsg(struct Curl_cfilter *cf,
                            const uint8_t *pkt, size_t pktlen, size_t gsolen,
                            size_t *psent)
 {
-#ifdef HAVE_SENDMSG
+#ifdef USE_SCION
+  ssize_t sent;
+  (void)gsolen;
+
+  *psent = 0;
+
+  sent = scion_send(qctx->socket,
+                     (const char *)pkt, (SEND_TYPE_ARG3)pktlen, MSG_DONTWAIT);
+
+  if(sent < 0) {
+    if(sent == SCION_WOULD_BLOCK) {
+      return CURLE_AGAIN;
+    }
+    else {
+      failf(data, "send() returned %zd (%s)", sent, scion_strerror((int)sent));
+      if(sent != SCION_MSG_TOO_LARGE) {
+        return CURLE_SEND_ERROR;
+      }
+      /* UDP datagram is too large; caused by PMTUD. Just let it be
+         lost. */
+    }
+  }
+#elif defined(HAVE_SENDMSG)
   struct iovec msg_iov;
   struct msghdr msg = {0};
   ssize_t sent;
@@ -328,7 +350,7 @@ CURLcode vquic_send_tail_split(struct Curl_cfilter *cf, struct Curl_easy *data,
   return vquic_flush(cf, data, qctx);
 }
 
-#if defined(HAVE_SENDMMSG) || defined(HAVE_SENDMSG)
+#if !defined(USE_SCION) && (defined(HAVE_SENDMMSG) || defined(HAVE_SENDMSG))
 static size_t vquic_msghdr_get_udp_gro(struct msghdr *msg)
 {
   int gso_size = 0;
@@ -358,7 +380,54 @@ static size_t vquic_msghdr_get_udp_gro(struct msghdr *msg)
 }
 #endif
 
-#ifdef HAVE_SENDMMSG
+#ifdef USE_SCION
+static CURLcode recvfrom_packets_scion(struct Curl_cfilter *cf,
+                                 struct Curl_easy *data,
+                                 struct cf_quic_ctx *qctx,
+                                 size_t max_pkts,
+                                 vquic_recv_pkt_cb *recv_cb, void *userp)
+{
+  uint8_t buf[64*1024];
+  int bufsize = (int)sizeof(buf);
+  struct sockaddr_storage remote_addr;
+  socklen_t remote_addrlen = sizeof(remote_addr);
+  size_t total_nread, pkts;
+  ssize_t nread;
+  char errstr[STRERROR_LEN];
+  CURLcode result = CURLE_OK;
+
+  DEBUGASSERT(max_pkts > 0);
+  for(pkts = 0, total_nread = 0; pkts < max_pkts;) {
+    nread = scion_recvfrom(qctx->socket, (char *)buf, bufsize, MSG_DONTWAIT,
+                            (struct sockaddr *)&remote_addr,
+                            &remote_addrlen, NULL, NULL);
+    if(nread < 0) {
+      if (nread == SCION_WOULD_BLOCK) {
+        CURL_TRC_CF(data, cf, "ingress, recvfrom -> EAGAIN");
+        goto out;
+      }
+      Curl_strerror(SOCKERRNO, errstr, sizeof(errstr));
+      failf(data, "QUIC: recvfrom() unexpectedly returned %zd (%s)",
+                  nread, scion_strerror((int)nread));
+      result = CURLE_RECV_ERROR;
+      goto out;
+    }
+
+    ++pkts;
+    total_nread += (size_t)nread;
+    result = recv_cb(buf, (size_t)nread, &remote_addr, remote_addrlen,
+                     0, userp);
+    if(result)
+      goto out;
+  }
+
+  out:
+    if(total_nread || result)
+      CURL_TRC_CF(data, cf, "recvd %zu packets with %zu bytes -> %d",
+                  pkts, total_nread, result);
+  return result;
+}
+#elif defined(HAVE_SENDMMSG)
 static CURLcode recvmmsg_packets(struct Curl_cfilter *cf,
                                  struct Curl_easy *data,
                                  struct cf_quic_ctx *qctx,
@@ -549,7 +618,7 @@ out:
   return result;
 }
 
-#else /* HAVE_SENDMMSG || HAVE_SENDMSG */
+#else /* USE_SCION || HAVE_SENDMMSG || HAVE_SENDMSG */
 static CURLcode recvfrom_packets(struct Curl_cfilter *cf,
                                  struct Curl_easy *data,
                                  struct cf_quic_ctx *qctx,
@@ -606,7 +675,7 @@ out:
                 pkts, total_nread, result);
   return result;
 }
-#endif /* !HAVE_SENDMMSG && !HAVE_SENDMSG */
+#endif /* !(USE_SCION || HAVE_SENDMMSG || HAVE_SENDMSG) */
 
 CURLcode vquic_recv_packets(struct Curl_cfilter *cf,
                             struct Curl_easy *data,
@@ -615,7 +684,9 @@ CURLcode vquic_recv_packets(struct Curl_cfilter *cf,
                             vquic_recv_pkt_cb *recv_cb, void *userp)
 {
   CURLcode result;
-#if defined(HAVE_SENDMMSG)
+#if defined(USE_SCION)
+  result = recvfrom_packets_scion(cf, data, qctx, max_pkts, recv_cb, userp);
+#elif defined(HAVE_SENDMMSG)
   result = recvmmsg_packets(cf, data, qctx, max_pkts, recv_cb, userp);
 #elif defined(HAVE_SENDMSG)
   result = recvmsg_packets(cf, data, qctx, max_pkts, recv_cb, userp);
